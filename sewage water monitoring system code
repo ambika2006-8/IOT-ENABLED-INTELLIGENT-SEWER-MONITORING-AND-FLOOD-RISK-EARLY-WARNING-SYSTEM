@@ -1,0 +1,1665 @@
+/*
+   ============================================================
+       ESP8266 SEWAGE WATER MONITORING SYSTEM
+   ============================================================
+
+   Hardware:
+   - ESP8266 NodeMCU
+   - 16x2 I2C LCD
+   - Rain Detector
+   - HC-SR04 Ultrasonic Sensor
+   - Water Flow Meter
+   - Digital Water Flow Detector
+
+   Monitoring:
+   - Sewage water level
+   - Flow rate
+   - Water flow status
+   - Rain status
+   - Blockage detection
+   - Overflow detection
+   - LCD display
+   - WiFi Web Dashboard
+   - Live graph
+   - CSV download
+
+   IMPORTANT LOGIC:
+   Water Flow Detector:
+      LOW  = WATER FLOWING
+      HIGH = WATER NOT FLOWING
+
+   Rain Sensor:
+      LOW  = RAIN
+      HIGH = NO RAIN
+
+   ============================================================
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Wire.h>
+#include <LCD_I2C.h>
+
+/* ============================================================
+                      WIFI SETTINGS
+   ============================================================ */
+
+const char* WIFI_SSID = "IOTCLOUD";
+const char* WIFI_PASSWORD = "12345678";
+
+/* ============================================================
+                      PIN DEFINITIONS
+   ============================================================ */
+
+// I2C LCD
+#define SDA_PIN D2
+#define SCL_PIN D1
+
+// Rain detector
+#define RAIN_PIN D0
+
+// Ultrasonic sensor
+#define TRIG_PIN D5
+#define ECHO_PIN D6
+
+// Digital water flow detector
+#define WATER_FLOW_DETECTOR D7
+
+// Flow meter pulse output
+#define FLOW_METER_PIN D3
+
+/* ============================================================
+                    LCD CONFIGURATION
+   ============================================================ */
+LCD_I2C lcd(0x27, 16, 2);
+
+/* ============================================================
+                    WEB SERVER
+   ============================================================ */
+
+ESP8266WebServer server(80);
+
+/* ============================================================
+                    FLOW METER
+   ============================================================ */
+
+// Change this according to your flow meter.
+// Common YF-S201 value is approximately 450 pulses/litre.
+volatile unsigned long flowPulseCount = 0;
+
+const float PULSES_PER_LITER = 450.0;
+
+unsigned long previousFlowMillis = 0;
+
+float flowRate = 0.0;
+float totalLiters = 0.0;
+
+/* ============================================================
+                  ULTRASONIC SETTINGS
+   ============================================================ */
+
+// Distance from ultrasonic sensor to empty sewage level.
+// Change according to your tank/channel installation.
+const float EMPTY_DISTANCE_CM = 17.0;
+
+// Minimum distance = maximum water level.
+// Change according to your installation.
+const float FULL_DISTANCE_CM = 5.0;
+
+// Overflow level percentage
+const float OVERFLOW_LEVEL = 90.0;
+
+// Blockage detection water level
+const float BLOCKAGE_LEVEL = 65.0;
+
+/* ============================================================
+                    SENSOR VARIABLES
+   ============================================================ */
+
+float distanceCM = 0.0;
+float waterLevelPercent = 0.0;
+
+bool rainDetected = false;
+bool waterFlowing = false;
+
+String systemStatus = "STARTING";
+String warningStatus = "NONE";
+
+/* ============================================================
+                    LCD TIMER
+   ============================================================ */
+
+unsigned long lastLCDUpdate = 0;
+int lcdPage = 0;
+
+/* ============================================================
+                    DATA LOGGING
+   ============================================================ */
+
+struct SensorData
+{
+  unsigned long timeStamp;
+  float waterLevel;
+  float distance;
+  float flow;
+  bool rain;
+  bool waterFlow;
+  String status;
+};
+
+#define HISTORY_SIZE 30
+
+SensorData history[HISTORY_SIZE];
+
+int historyIndex = 0;
+int historyCount = 0;
+
+unsigned long lastHistoryUpdate = 0;
+
+/* ============================================================
+                     INTERRUPT
+   ============================================================ */
+
+ICACHE_RAM_ATTR void flowMeterInterrupt()
+{
+  flowPulseCount++;
+}
+
+/* ============================================================
+                     READ ULTRASONIC
+   ============================================================ */
+
+float readUltrasonic()
+{
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0)
+  {
+    return -1;
+  }
+
+  float distance = duration * 0.0343 / 2.0;
+
+  return distance;
+}
+
+/* ============================================================
+                  CALCULATE WATER LEVEL
+   ============================================================ */
+
+float calculateWaterLevel(float distance)
+{
+  if (distance < 0)
+  {
+    return 0;
+  }
+
+  float level;
+
+  level = ((EMPTY_DISTANCE_CM - distance) /
+           (EMPTY_DISTANCE_CM - FULL_DISTANCE_CM)) * 100.0;
+
+  if (level < 0)
+    level = 0;
+
+  if (level > 100)
+    level = 100;
+
+  return level;
+}
+
+/* ============================================================
+                    READ SENSORS
+   ============================================================ */
+
+void readSensors()
+{
+  /* ---------- RAIN ---------- */
+
+  if (digitalRead(RAIN_PIN) == LOW)
+  {
+    rainDetected = true;
+  }
+  else
+  {
+    rainDetected = false;
+  }
+
+  /* ---------- WATER FLOW DETECTOR ---------- */
+
+  // LOW = WATER FLOWING
+  // HIGH = WATER NOT FLOWING
+
+  if (digitalRead(WATER_FLOW_DETECTOR) == LOW)
+  {
+    waterFlowing = true;
+  }
+  else
+  {
+    waterFlowing = false;
+  }
+
+  /* ---------- ULTRASONIC ---------- */
+
+  distanceCM = readUltrasonic();
+
+  if (distanceCM > 0)
+  {
+    waterLevelPercent = calculateWaterLevel(distanceCM);
+  }
+
+  /* ---------- SYSTEM STATUS ---------- */
+
+  if (waterLevelPercent >= OVERFLOW_LEVEL)
+  {
+    systemStatus = "OVERFLOW";
+    warningStatus = "DANGER";
+  }
+
+  else if (rainDetected && waterLevelPercent >= 70)
+  {
+    systemStatus = "RAIN OVERFLOW";
+    warningStatus = "WARNING";
+  }
+
+  else if (!waterFlowing && waterLevelPercent >= BLOCKAGE_LEVEL)
+  {
+    systemStatus = "BLOCKAGE";
+    warningStatus = "WARNING";
+  }
+
+  else if (!waterFlowing)
+  {
+    systemStatus = "NO FLOW";
+    warningStatus = "WARNING";
+  }
+
+  else if (waterFlowing && waterLevelPercent < BLOCKAGE_LEVEL)
+  {
+    systemStatus = "NORMAL FLOW";
+    warningStatus = "NORMAL";
+  }
+
+  else
+  {
+    systemStatus = "MONITORING";
+    warningStatus = "NORMAL";
+  }
+}
+
+/* ============================================================
+                  CALCULATE FLOW RATE
+   ============================================================ */
+
+void calculateFlowRate()
+{
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousFlowMillis >= 1000)
+  {
+    noInterrupts();
+
+    unsigned long pulses = flowPulseCount;
+
+    flowPulseCount = 0;
+
+    interrupts();
+
+    float liters = pulses / PULSES_PER_LITER;
+
+    flowRate = liters * 60.0;
+
+    totalLiters += liters;
+
+    previousFlowMillis = currentMillis;
+  }
+}
+
+/* ============================================================
+                    LCD HELPER
+   ============================================================ */
+
+void clearLCD()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("                ");
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  lcd.clear();
+}
+
+/* ============================================================
+                    LCD PAGE 1
+   ============================================================ */
+
+void displayLCDPage1()
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("LEVEL:");
+
+  lcd.print((int)waterLevelPercent);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+
+  if (waterFlowing)
+  {
+    lcd.print("FLOW: YES");
+  }
+  else
+  {
+    lcd.print("FLOW: NO");
+  }
+}
+
+/* ============================================================
+                    LCD PAGE 2
+   ============================================================ */
+
+void displayLCDPage2()
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("FLOW:");
+  lcd.print(flowRate, 1);
+  lcd.print(" L/m");
+
+  lcd.setCursor(0, 1);
+
+  if (rainDetected)
+  {
+    lcd.print("RAIN: YES");
+  }
+  else
+  {
+    lcd.print("RAIN: NO");
+  }
+}
+
+/* ============================================================
+                    LCD PAGE 3
+   ============================================================ */
+
+void displayLCDPage3()
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("STATUS:");
+
+  lcd.setCursor(0, 1);
+
+  if (systemStatus == "NORMAL FLOW")
+  {
+    lcd.print("NORMAL FLOW");
+  }
+
+  else if (systemStatus == "NO FLOW")
+  {
+    lcd.print("NO FLOW");
+  }
+
+  else if (systemStatus == "BLOCKAGE")
+  {
+    lcd.print("BLOCKAGE!");
+  }
+
+  else if (systemStatus == "OVERFLOW")
+  {
+    lcd.print("OVERFLOW!");
+  }
+
+  else if (systemStatus == "RAIN OVERFLOW")
+  {
+    lcd.print("RAIN OVERFLOW");
+  }
+
+  else
+  {
+    lcd.print(systemStatus);
+  }
+}
+
+/* ============================================================
+                    LCD PAGE 4
+   ============================================================ */
+
+void displayLCDPage4()
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("DIST:");
+
+  if (distanceCM > 0)
+  {
+    lcd.print(distanceCM, 1);
+    lcd.print("cm");
+  }
+  else
+  {
+    lcd.print("ERROR");
+  }
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("TOTAL:");
+  lcd.print(totalLiters, 1);
+  lcd.print("L");
+}
+
+/* ============================================================
+                    UPDATE LCD
+   ============================================================ */
+
+void updateLCD()
+{
+  if (millis() - lastLCDUpdate < 3000)
+  {
+    return;
+  }
+
+  lastLCDUpdate = millis();
+
+  if (lcdPage == 0)
+  {
+    displayLCDPage1();
+  }
+
+  else if (lcdPage == 1)
+  {
+    displayLCDPage2();
+  }
+
+  else if (lcdPage == 2)
+  {
+    displayLCDPage3();
+  }
+
+  else
+  {
+    displayLCDPage4();
+  }
+
+  lcdPage++;
+
+  if (lcdPage > 3)
+  {
+    lcdPage = 0;
+  }
+}
+
+/* ============================================================
+                  SAVE HISTORY DATA
+   ============================================================ */
+
+void saveHistory()
+{
+  if (millis() - lastHistoryUpdate < 5000)
+  {
+    return;
+  }
+
+  lastHistoryUpdate = millis();
+
+  history[historyIndex].timeStamp = millis();
+
+  history[historyIndex].waterLevel = waterLevelPercent;
+
+  history[historyIndex].distance = distanceCM;
+
+  history[historyIndex].flow = flowRate;
+
+  history[historyIndex].rain = rainDetected;
+
+  history[historyIndex].waterFlow = waterFlowing;
+
+  history[historyIndex].status = systemStatus;
+
+  historyIndex++;
+
+  if (historyIndex >= HISTORY_SIZE)
+  {
+    historyIndex = 0;
+  }
+
+  if (historyCount < HISTORY_SIZE)
+  {
+    historyCount++;
+  }
+}
+
+/* ============================================================
+                   WEB PAGE
+   ============================================================ */
+
+void handleRoot()
+{
+  String html = R"rawliteral(
+
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Sewage Water Monitoring</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+body{
+  margin:0;
+  font-family:Arial;
+  background:#eef2f7;
+  color:#172033;
+}
+
+.header{
+  background:#172033;
+  color:white;
+  padding:20px;
+  text-align:center;
+}
+
+.container{
+  max-width:1200px;
+  margin:auto;
+  padding:15px;
+}
+
+.cards{
+  display:grid;
+  grid-template-columns:
+  repeat(auto-fit,minmax(220px,1fr));
+  gap:15px;
+}
+
+.card{
+  background:white;
+  padding:20px;
+  border-radius:12px;
+  box-shadow:0 3px 10px rgba(0,0,0,.1);
+}
+
+.title{
+  font-size:14px;
+  color:#666;
+}
+
+.value{
+  font-size:28px;
+  font-weight:bold;
+  margin-top:10px;
+}
+
+.panel{
+  background:white;
+  margin-top:20px;
+  padding:20px;
+  border-radius:12px;
+}
+
+button{
+  padding:12px 18px;
+  border:0;
+  border-radius:8px;
+  background:#172033;
+  color:white;
+  cursor:pointer;
+}
+
+.normal{
+  color:green;
+}
+
+.warning{
+  color:orange;
+}
+
+.danger{
+  color:red;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="header">
+
+<h1>SEWAGE WATER MONITORING SYSTEM</h1>
+
+<p>ESP8266 Based Smart Monitoring</p>
+
+</div>
+
+
+<div class="container">
+
+
+<div class="panel">
+
+<h2>System Status</h2>
+
+<div
+id="mainStatus"
+class="value">
+CONNECTING...
+</div>
+
+</div>
+
+
+<div class="cards">
+
+
+<div class="card">
+
+<div class="title">
+WATER LEVEL
+</div>
+
+<div class="value">
+
+<span id="level">
+0
+</span> %
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+WATER DISTANCE
+</div>
+
+<div class="value">
+
+<span id="distance">
+0
+</span> cm
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+FLOW RATE
+</div>
+
+<div class="value">
+
+<span id="flow">
+0
+</span> L/min
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+TOTAL WATER
+</div>
+
+<div class="value">
+
+<span id="total">
+0
+</span> L
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+WATER FLOW
+</div>
+
+<div
+id="waterFlow"
+class="value">
+
+-
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+RAIN STATUS
+</div>
+
+<div
+id="rain"
+class="value">
+
+-
+
+</div>
+
+</div>
+
+
+</div>
+
+
+<div class="panel">
+
+<h2>Live Water Monitoring Graph</h2>
+
+<canvas id="sensorChart"></canvas>
+
+</div>
+
+
+<div class="panel">
+
+<h2>Sensor Information</h2>
+
+<table width="100%" cellpadding="10">
+
+<tr>
+<th>Parameter</th>
+<th>Value</th>
+</tr>
+
+<tr>
+<td>Water Level</td>
+<td id="tableLevel">-</td>
+</tr>
+
+<tr>
+<td>Distance</td>
+<td id="tableDistance">-</td>
+</tr>
+
+<tr>
+<td>Flow Rate</td>
+<td id="tableFlow">-</td>
+</tr>
+
+<tr>
+<td>Rain</td>
+<td id="tableRain">-</td>
+</tr>
+
+<tr>
+<td>Water Flow</td>
+<td id="tableWaterFlow">-</td>
+</tr>
+
+<tr>
+<td>Status</td>
+<td id="tableStatus">-</td>
+</tr>
+
+</table>
+
+</div>
+
+
+<div class="panel">
+
+<h2>Warning Information</h2>
+
+<p>
+Overflow Level:
+<b>90%</b>
+</p>
+
+<p>
+Blockage Detection Level:
+<b>65%</b>
+</p>
+
+<p>
+Current Warning:
+<b id="warning">-</b>
+</p>
+
+</div>
+
+
+<div class="panel">
+
+<button onclick="downloadCSV()">
+Download CSV
+</button>
+
+</div>
+
+
+<div class="panel">
+
+<p>
+ESP8266 IP Address:
+<b id="ipAddress">-</b>
+</p>
+
+</div>
+
+
+</div>
+
+
+<script>
+
+/* =====================================================
+   CHART
+   ===================================================== */
+
+let chart = null;
+
+let labels = [];
+
+let levelData = [];
+
+let flowData = [];
+
+
+function createChart()
+{
+
+  const ctx =
+    document
+    .getElementById("sensorChart")
+    .getContext("2d");
+
+
+  chart = new Chart(ctx,
+  {
+
+    type:"line",
+
+    data:
+    {
+
+      labels:labels,
+
+      datasets:
+      [
+
+        {
+          label:"Water Level (%)",
+
+          data:levelData,
+
+          borderWidth:2,
+
+          tension:0.3
+        },
+
+        {
+          label:"Flow Rate (L/min)",
+
+          data:flowData,
+
+          borderWidth:2,
+
+          tension:0.3
+        }
+
+      ]
+
+    },
+
+    options:
+    {
+
+      responsive:true,
+
+      scales:
+      {
+
+        y:
+        {
+          beginAtZero:true
+        }
+
+      }
+
+    }
+
+  });
+
+}
+
+
+/* =====================================================
+   UPDATE DASHBOARD
+   ===================================================== */
+
+async function updateDashboard()
+{
+
+  try
+  {
+
+    const response =
+      await fetch("/api/data");
+
+
+    const data =
+      await response.json();
+
+
+    document
+      .getElementById("level")
+      .innerHTML =
+      Number(data.waterLevel).toFixed(1);
+
+
+    document
+      .getElementById("distance")
+      .innerHTML =
+      Number(data.distance).toFixed(1);
+
+
+    document
+      .getElementById("flow")
+      .innerHTML =
+      Number(data.flowRate).toFixed(2);
+
+
+    document
+      .getElementById("total")
+      .innerHTML =
+      Number(data.totalLiters).toFixed(2);
+
+
+    document
+      .getElementById("ipAddress")
+      .innerHTML =
+      data.ip;
+
+
+    document
+      .getElementById("mainStatus")
+      .innerHTML =
+      data.status;
+
+
+    /* WATER FLOW */
+
+    if(data.waterFlow === true)
+    {
+
+      document
+        .getElementById("waterFlow")
+        .innerHTML =
+        "FLOWING";
+
+      document
+        .getElementById("waterFlow")
+        .className =
+        "value normal";
+
+    }
+
+    else
+    {
+
+      document
+        .getElementById("waterFlow")
+        .innerHTML =
+        "NOT FLOWING";
+
+      document
+        .getElementById("waterFlow")
+        .className =
+        "value warning";
+
+    }
+
+
+    /* RAIN */
+
+    if(data.rain === true)
+    {
+
+      document
+        .getElementById("rain")
+        .innerHTML =
+        "RAIN DETECTED";
+
+      document
+        .getElementById("rain")
+        .className =
+        "value warning";
+
+    }
+
+    else
+    {
+
+      document
+        .getElementById("rain")
+        .innerHTML =
+        "NO RAIN";
+
+      document
+        .getElementById("rain")
+        .className =
+        "value normal";
+
+    }
+
+
+    /* TABLE */
+
+    document
+      .getElementById("tableLevel")
+      .innerHTML =
+      Number(data.waterLevel).toFixed(1) +
+      " %";
+
+
+    document
+      .getElementById("tableDistance")
+      .innerHTML =
+      Number(data.distance).toFixed(1) +
+      " cm";
+
+
+    document
+      .getElementById("tableFlow")
+      .innerHTML =
+      Number(data.flowRate).toFixed(2) +
+      " L/min";
+
+
+    document
+      .getElementById("tableRain")
+      .innerHTML =
+      data.rain ? "YES" : "NO";
+
+
+    document
+      .getElementById("tableWaterFlow")
+      .innerHTML =
+      data.waterFlow ?
+      "FLOWING" :
+      "NOT FLOWING";
+
+
+    document
+      .getElementById("tableStatus")
+      .innerHTML =
+      data.status;
+
+
+    document
+      .getElementById("warning")
+      .innerHTML =
+      data.warning;
+
+
+    /* STATUS COLOR */
+
+    const status =
+      document.getElementById("mainStatus");
+
+
+    status.className =
+      "value";
+
+
+    if(
+      data.status === "OVERFLOW" ||
+      data.status === "RAIN OVERFLOW"
+    )
+    {
+
+      status.classList.add("danger");
+
+    }
+
+    else if(
+      data.status === "BLOCKAGE" ||
+      data.status === "NO FLOW"
+    )
+    {
+
+      status.classList.add("warning");
+
+    }
+
+    else
+    {
+
+      status.classList.add("normal");
+
+    }
+
+
+    /* GRAPH */
+
+    const currentTime =
+      new Date()
+      .toLocaleTimeString();
+
+
+    labels.push(currentTime);
+
+    levelData.push(
+      Number(data.waterLevel)
+    );
+
+    flowData.push(
+      Number(data.flowRate)
+    );
+
+
+    /* KEEP LAST 20 VALUES */
+
+    if(labels.length > 20)
+    {
+
+      labels.shift();
+
+      levelData.shift();
+
+      flowData.shift();
+
+    }
+
+
+    if(chart)
+    {
+      chart.update();
+    }
+
+  }
+
+  catch(error)
+  {
+
+    console.log(
+      "Dashboard Error:",
+      error
+    );
+
+    document
+      .getElementById("mainStatus")
+      .innerHTML =
+      "CONNECTION ERROR";
+
+  }
+
+}
+
+
+/* =====================================================
+   CSV DOWNLOAD
+   ===================================================== */
+
+function downloadCSV()
+{
+
+  window.location.href =
+    "/download";
+
+}
+
+
+/* =====================================================
+   START DASHBOARD
+   ===================================================== */
+
+createChart();
+
+updateDashboard();
+
+
+/* UPDATE EVERY 2 SECONDS */
+
+setInterval(
+  updateDashboard,
+  2000
+);
+
+</script>
+
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+/* ============================================================
+                    JSON API
+   ============================================================ */
+
+void handleAPI()
+{
+  String json = "{";
+
+  json += "\"waterLevel\":";
+  json += String(waterLevelPercent, 1);
+
+  json += ",";
+
+  json += "\"distance\":";
+  json += String(distanceCM, 1);
+
+  json += ",";
+
+  json += "\"flowRate\":";
+  json += String(flowRate, 2);
+
+  json += ",";
+
+  json += "\"totalLiters\":";
+  json += String(totalLiters, 2);
+
+  json += ",";
+
+  json += "\"rain\":";
+  json += rainDetected ? "true" : "false";
+
+  json += ",";
+
+  json += "\"waterFlow\":";
+  json += waterFlowing ? "true" : "false";
+
+  json += ",";
+
+  json += "\"status\":\"";
+  json += systemStatus;
+  json += "\"";
+
+  json += ",";
+
+  json += "\"warning\":\"";
+  json += warningStatus;
+  json += "\"";
+
+  json += ",";
+
+  json += "\"ip\":\"";
+  json += WiFi.localIP().toString();
+  json += "\"";
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+/* ============================================================
+                    CSV DOWNLOAD
+   ============================================================ */
+
+void handleDownload()
+{
+  String csv = "";
+
+  csv += "Time(ms),Water Level(%),Distance(cm),Flow Rate(L/min),Rain,Water Flow,Status\n";
+
+  int start;
+
+  if (historyCount < HISTORY_SIZE)
+  {
+    start = 0;
+  }
+  else
+  {
+    start = historyIndex;
+  }
+
+  for (int i = 0; i < historyCount; i++)
+  {
+    int index = (start + i) % HISTORY_SIZE;
+
+    csv += String(history[index].timeStamp);
+    csv += ",";
+
+    csv += String(history[index].waterLevel, 1);
+    csv += ",";
+
+    csv += String(history[index].distance, 1);
+    csv += ",";
+
+    csv += String(history[index].flow, 2);
+    csv += ",";
+
+    csv += history[index].rain ? "YES" : "NO";
+    csv += ",";
+
+    csv += history[index].waterFlow ? "FLOWING" : "NOT FLOWING";
+    csv += ",";
+
+    csv += history[index].status;
+
+    csv += "\n";
+  }
+
+  server.sendHeader(
+    "Content-Disposition",
+    "attachment; filename=sewage_monitoring.csv"
+  );
+
+  server.send(200, "text/csv", csv);
+}
+
+/* ============================================================
+                    NOT FOUND
+   ============================================================ */
+
+void handleNotFound()
+{
+  server.send(
+    404,
+    "text/plain",
+    "404 - Page Not Found"
+  );
+}
+
+/* ============================================================
+                    WIFI CONNECTION
+   ============================================================ */
+
+void connectWiFi()
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+
+  lcd.setCursor(0, 1);
+  lcd.print(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  int count = 0;
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+
+    lcd.setCursor(15, 0);
+    lcd.print(".");
+
+    count++;
+
+    if (count >= 30)
+    {
+      lcd.clear();
+
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi Failed");
+
+      lcd.setCursor(0, 1);
+      lcd.print("Restarting...");
+
+      delay(2000);
+
+      ESP.restart();
+    }
+  }
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connected");
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(WiFi.localIP());
+
+  delay(3000);
+}
+
+/* ============================================================
+                    SETUP
+   ============================================================ */
+
+void setup()
+{
+  Serial.begin(115200);
+
+  /* ---------- I2C ---------- */
+
+  Wire.begin(
+    SDA_PIN,
+    SCL_PIN
+  );
+
+  /* ---------- LCD ---------- */
+
+  lcd.begin();
+  lcd.backlight();
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SEWAGE WATER");
+
+  lcd.setCursor(0, 1);
+  lcd.print("MONITORING");
+
+  delay(2500);
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("ESP8266 SYSTEM");
+
+  lcd.setCursor(0, 1);
+  lcd.print("STARTING...");
+
+  delay(1500);
+
+  /* ---------- PIN MODES ---------- */
+
+  pinMode(
+    RAIN_PIN,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    WATER_FLOW_DETECTOR,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    FLOW_METER_PIN,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    TRIG_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    ECHO_PIN,
+    INPUT
+  );
+
+  digitalWrite(
+    TRIG_PIN,
+    LOW
+  );
+
+  /* ---------- FLOW INTERRUPT ---------- */
+
+  attachInterrupt(
+    digitalPinToInterrupt(FLOW_METER_PIN),
+    flowMeterInterrupt,
+    RISING
+  );
+
+  /* ---------- WIFI ---------- */
+
+  connectWiFi();
+
+  /* ---------- WEB SERVER ---------- */
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
+  server.on(
+    "/api/data",
+    handleAPI
+  );
+
+  server.on(
+    "/download",
+    handleDownload
+  );
+
+  server.onNotFound(
+    handleNotFound
+  );
+
+  server.begin();
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("SEWAGE MONITORING SYSTEM");
+  Serial.println("==============================");
+
+  Serial.print("IP Address: ");
+  Serial.println(
+    WiFi.localIP()
+  );
+
+  Serial.println("Web Server Started");
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("WEB SERVER OK");
+
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+
+  delay(3000);
+}
+
+/* ============================================================
+                    MAIN LOOP
+   ============================================================ */
+
+void loop()
+{
+  /* ---------- WEB SERVER ---------- */
+
+  server.handleClient();
+
+  /* ---------- SENSOR READING ---------- */
+
+  readSensors();
+
+  /* ---------- FLOW CALCULATION ---------- */
+
+  calculateFlowRate();
+
+  /* ---------- LCD ---------- */
+
+  updateLCD();
+
+  /* ---------- HISTORY ---------- */
+
+  saveHistory();
+
+  /* ---------- SERIAL MONITOR ---------- */
+
+  static unsigned long lastSerial = 0;
+
+  if (millis() - lastSerial >= 3000)
+  {
+    lastSerial = millis();
+
+    Serial.println();
+    Serial.println("------------------------------");
+
+    Serial.print("Water Level : ");
+    Serial.print(waterLevelPercent);
+    Serial.println(" %");
+
+    Serial.print("Distance    : ");
+    Serial.print(distanceCM);
+    Serial.println(" cm");
+
+    Serial.print("Flow Rate   : ");
+    Serial.print(flowRate);
+    Serial.println(" L/min");
+
+    Serial.print("Total Water : ");
+    Serial.print(totalLiters);
+    Serial.println(" L");
+
+    Serial.print("Rain        : ");
+
+    if (rainDetected)
+      Serial.println("YES");
+    else
+      Serial.println("NO");
+
+    Serial.print("Water Flow  : ");
+
+    if (waterFlowing)
+      Serial.println("FLOWING");
+    else
+      Serial.println("NOT FLOWING");
+
+    Serial.print("STATUS      : ");
+    Serial.println(systemStatus);
+
+    Serial.print("WARNING     : ");
+    Serial.println(warningStatus);
+
+    Serial.println("------------------------------");
+  }
+
+  delay(50);
+}
